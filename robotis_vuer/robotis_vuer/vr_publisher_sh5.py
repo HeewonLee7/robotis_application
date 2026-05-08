@@ -22,6 +22,7 @@ import os
 import socket
 import threading
 import traceback
+from typing import Sequence
 
 from geometry_msgs.msg import Point, Point32, PoseStamped, Quaternion, Twist
 from nav_msgs.msg import Odometry
@@ -127,6 +128,52 @@ BODY_JOINT_KEYS = [
     'right-foot-transverse',
     'right-foot-ball',
 ]
+
+LEFT_JOINT_NAMES = [
+    'finger_l_joint1',
+    'finger_l_joint2',
+    'finger_l_joint3',
+    'finger_l_joint4',
+    'finger_l_joint5',
+    'finger_l_joint6',
+    'finger_l_joint7',
+    'finger_l_joint8',
+    'finger_l_joint9',
+    'finger_l_joint10',
+    'finger_l_joint11',
+    'finger_l_joint12',
+    'finger_l_joint13',
+    'finger_l_joint14',
+    'finger_l_joint15',
+    'finger_l_joint16',
+    'finger_l_joint17',
+    'finger_l_joint18',
+    'finger_l_joint19',
+    'finger_l_joint20',
+]
+RIGHT_JOINT_NAMES = [
+    'finger_r_joint1',
+    'finger_r_joint2',
+    'finger_r_joint3',
+    'finger_r_joint4',
+    'finger_r_joint5',
+    'finger_r_joint6',
+    'finger_r_joint7',
+    'finger_r_joint8',
+    'finger_r_joint9',
+    'finger_r_joint10',
+    'finger_r_joint11',
+    'finger_r_joint12',
+    'finger_r_joint13',
+    'finger_r_joint14',
+    'finger_r_joint15',
+    'finger_r_joint16',
+    'finger_r_joint17',
+    'finger_r_joint18',
+    'finger_r_joint19',
+    'finger_r_joint20',
+]
+
 EYE_NECK_OFFSET_Z = -0.25  # z offset occurs when vr headset is worn on neck
 
 
@@ -135,6 +182,8 @@ class VRTrajectoryPublisher(Node):
     def __init__(self):
         super().__init__('vr_trajectory_publisher')
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.INFO)
+        self.left_joint_names = list(LEFT_JOINT_NAMES)
+        self.right_joint_names = list(RIGHT_JOINT_NAMES)
 
         # Lift and base (whole-body) parameters
         self.declare_parameter('enable_lift_publishing', False)
@@ -362,6 +411,16 @@ class VRTrajectoryPublisher(Node):
             '/right_hand/hand_joint_pos',
             self.vr_stream_qos
         )
+        self.left_publisher_ = self.create_publisher(
+            JointTrajectory,
+            '/leader/joint_trajectory_command_broadcaster_left_hand/joint_trajectory',
+            self.vr_stream_qos
+        )
+        self.right_publisher_ = self.create_publisher(
+            JointTrajectory,
+            '/leader/joint_trajectory_command_broadcaster_right_hand/joint_trajectory',
+            self.vr_stream_qos
+        )
         self.head_joint_pub = self.create_publisher(
             JointTrajectory,
             '/leader/joystick_controller_left/joint_trajectory',
@@ -401,15 +460,12 @@ class VRTrajectoryPublisher(Node):
             PoseStamped, '/r_shoulder_pose', self.vr_stream_qos
         )
 
-        # Reactivate topic
-        self.reactivate_sub = self.create_subscription(
+        # Reactivate topic publisher (sync arm controller on gesture toggle)
+        self.reactivate_pub = self.create_publisher(
             Bool,
             '/reactivate',
-            self.reactivate_callback,
             10
         )
-        self.has_received_reactivate = False
-        self.last_reactivate_state = False
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self.odom_callback, self.vr_stream_qos
         )
@@ -537,6 +593,11 @@ class VRTrajectoryPublisher(Node):
         self.hand_log_counter = 0
         self.wrist_debug_log_counter = 0
         self.wrist_debug_log_every_n = 30
+        self.gesture_hold_duration_sec = 3.0
+        self.gesture_combo_hold_start_time = None
+        self.gesture_toggle_latched = False
+        self.gesture_countdown_last_logged_sec = None
+        self.gesture_combo_active_prev = False
 
         self.status_timer = self.create_timer(3.0, self.log_status)
         self.head_log_counter = 0
@@ -551,34 +612,17 @@ class VRTrajectoryPublisher(Node):
         vr_status = 'ENABLED' if self.vr_publishing_enabled else 'DISABLED'
         self.get_logger().info(
             f'VR publishing is {vr_status} by default. '
-            'Publish std_msgs/Bool on /reactivate to set enable/disable.'
+            'Use hand gesture (one pinch + one squeeze for 3s) to toggle.'
         )
 
     def odom_callback(self, msg):
         """Receive robot odometry for base control."""
         self.current_odom = msg
 
-    def reactivate_callback(self, msg):
-        """Set VR publishing from /reactivate Bool message."""
-        new_state = bool(msg.data)
-        reset_references = (
-            self.has_received_reactivate
-            and (not self.last_reactivate_state)
-            and new_state
-        )
-        self._set_vr_publishing_enabled(
-            new_state,
-            reset_references=reset_references,
-        )
-        self.last_reactivate_state = new_state
-        self.has_received_reactivate = True
-
     def _set_vr_publishing_enabled(self, new_state, reset_references=False):
-        """Apply VR publishing on/off and the same side effects as the old Bool topic."""
+        """Apply VR publishing state and reset references when enabling."""
         new_state = bool(new_state)
         self.vr_publishing_enabled = new_state
-        # status = 'ENABLED' if self.vr_publishing_enabled else 'DISABLED'
-        # self.get_logger().info(f'VR publishing set to: {status}')
 
         if self.vr_publishing_enabled and reset_references:
             self.start_poses_left = False
@@ -1158,13 +1202,81 @@ class VRTrajectoryPublisher(Node):
         except Exception as e:
             self.get_logger().error(f'Error in hand tracking session: {e}')
 
+    def _is_toggle_gesture_active(self, left_state, right_state):
+        """True when one hand pinches and the other hand squeezes."""
+        if left_state is None or right_state is None:
+            return False
+        return (
+            (left_state['pinch'] and right_state['squeeze'])
+            or (right_state['pinch'] and left_state['squeeze'])
+        )
+
+    def _publish_reactivate_state(self, enabled):
+        """Publish /reactivate Bool for arm-controller start/pause."""
+        if not rclpy.ok():
+            return
+        self.reactivate_pub.publish(Bool(data=bool(enabled)))
+
+    def _update_gesture_toggle(self, left_state, right_state):
+        """Toggle VR publishing after holding the gesture combo for 3 seconds."""
+        combo_active = self._is_toggle_gesture_active(left_state, right_state)
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+
+        if not combo_active:
+            if self.gesture_combo_active_prev and not self.gesture_toggle_latched:
+                self.get_logger().info(
+                    '[GESTURE] Toggle gesture interrupted.'
+                )
+            self.gesture_combo_hold_start_time = None
+            self.gesture_toggle_latched = False
+            self.gesture_countdown_last_logged_sec = None
+            self.gesture_combo_active_prev = False
+            return
+
+        if self.gesture_combo_hold_start_time is None:
+            self.gesture_combo_hold_start_time = now_sec
+            self.gesture_countdown_last_logged_sec = None
+            target_state = 'ENABLE' if not self.vr_publishing_enabled else 'PAUSE'
+            self.get_logger().info(
+                f'[GESTURE] Toggle detected. Hold for 3.0s to {target_state} VR teleop.'
+            )
+            self.gesture_combo_active_prev = True
+            return
+
+        held_sec = now_sec - self.gesture_combo_hold_start_time
+        remaining_sec = max(0.0, self.gesture_hold_duration_sec - held_sec)
+        countdown_sec = int(math.ceil(remaining_sec))
+        if (
+            not self.gesture_toggle_latched
+            and held_sec < self.gesture_hold_duration_sec
+            and countdown_sec != self.gesture_countdown_last_logged_sec
+        ):
+            self.get_logger().info(
+                f'[GESTURE] Hold countdown: {countdown_sec}s'
+            )
+            self.gesture_countdown_last_logged_sec = countdown_sec
+
+        if held_sec < self.gesture_hold_duration_sec or self.gesture_toggle_latched:
+            return
+
+        new_state = not self.vr_publishing_enabled
+        self._set_vr_publishing_enabled(new_state, reset_references=new_state)
+        self._publish_reactivate_state(new_state)
+        status_text = 'activated' if new_state else 'disabled'
+        self.get_logger().info(f'[GESTURE] VR teleop {status_text}.')
+        self.gesture_toggle_latched = True
+        self.gesture_countdown_last_logged_sec = None
+        self.gesture_combo_active_prev = True
+
     async def on_hand_move(self, event, session):
         """Handle hand movement events."""
         try:
-            if not self.vr_publishing_enabled:
-                return
             if not isinstance(event.value, dict):
                 return
+
+            left_state = self._extract_gesture_state(event.value.get('leftState'))
+            right_state = self._extract_gesture_state(event.value.get('rightState'))
+            self._update_gesture_toggle(left_state, right_state)
 
             # Only store hand data; processing happens in on_body_tracking_move
             # with same-frame head
@@ -1198,6 +1310,7 @@ class VRTrajectoryPublisher(Node):
             if not rclpy.ok():
                 return
             if not self.vr_publishing_enabled:
+                self.publish_zero_hand_joint_trajectories()
                 return
 
             if not isinstance(event.value, dict) or not event.value:
@@ -1631,6 +1744,29 @@ class VRTrajectoryPublisher(Node):
         s1 = sin_theta / sin_theta_0
         return s0 * q0 + s1 * q1
 
+    def _extract_gesture_state(self, hand_state):
+        """Extract hand gesture booleans/values from dict-like/object payload."""
+        if hand_state is None:
+            return None
+        if isinstance(hand_state, dict):
+            return {
+                'pinch': bool(hand_state.get('pinch', False)),
+                'squeeze': bool(hand_state.get('squeeze', False)),
+                'tap': bool(hand_state.get('tap', False)),
+                'pinchValue': float(hand_state.get('pinchValue', 0.0)),
+                'squeezeValue': float(hand_state.get('squeezeValue', 0.0)),
+                'tapValue': float(hand_state.get('tapValue', 0.0)),
+            }
+
+        return {
+            'pinch': bool(getattr(hand_state, 'pinch', False)),
+            'squeeze': bool(getattr(hand_state, 'squeeze', False)),
+            'tap': bool(getattr(hand_state, 'tap', False)),
+            'pinchValue': float(getattr(hand_state, 'pinchValue', 0.0)),
+            'squeezeValue': float(getattr(hand_state, 'squeezeValue', 0.0)),
+            'tapValue': float(getattr(hand_state, 'tapValue', 0.0)),
+        }
+
     def apply_elbow_wrist_safety(self, side, pose_role, position):
         """Clamp wrist-elbow distance to safety limit (wrist has priority)."""
         if pose_role not in ('wrist', 'elbow'):
@@ -1646,6 +1782,56 @@ class VRTrajectoryPublisher(Node):
         if dist > self.max_elbow_wrist_distance and dist > 0.0:
             position = other_pos + delta * (self.max_elbow_wrist_distance / dist)
         return position
+    
+    def publish_trajectory_left(
+        self,
+        goal: np.ndarray,
+        duration: float = 0,
+    ) -> None:
+        """Publish a left-hand joint trajectory command."""
+        self._publish_trajectory(
+            self.left_publisher_,
+            self.left_joint_names,
+            goal,
+            duration,
+        )
+
+    def publish_zero_hand_joint_trajectories(self) -> None:
+        """Publish zero joint trajectories to both hand controllers."""
+        left_zero_goal = np.zeros(len(self.left_joint_names), dtype=np.float64)
+        right_zero_goal = np.zeros(len(self.right_joint_names), dtype=np.float64)
+        self.publish_trajectory_left(left_zero_goal, duration=0.0)
+        self.publish_trajectory_right(right_zero_goal, duration=0.0)
+
+    def publish_trajectory_right(
+        self,
+        goal: np.ndarray,
+        duration: float = 0,
+    ) -> None:
+        """Publish a right-hand joint trajectory command."""
+        self._publish_trajectory(
+            self.right_publisher_,
+            self.right_joint_names,
+            goal,
+            duration,
+        )
+
+    def _publish_trajectory(
+        self,
+        publisher,
+        joint_names: Sequence[str],
+        goal: np.ndarray,
+        duration: float,
+    ) -> None:
+        """Build and publish a `JointTrajectory` message."""
+        msg = JointTrajectory()
+        msg.joint_names = list(joint_names)
+        goal_point = JointTrajectoryPoint()
+        goal_point.positions = goal.tolist()
+        goal_point.time_from_start.sec = int(duration)
+        goal_point.time_from_start.nanosec = 0
+        msg.points.append(goal_point)
+        publisher.publish(msg)
 
     def __del__(self):
         try:
