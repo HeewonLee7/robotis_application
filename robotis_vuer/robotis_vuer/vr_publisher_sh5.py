@@ -24,6 +24,7 @@ import threading
 import traceback
 from typing import Sequence
 
+from ffw_interfaces.msg import HandJoints
 from geometry_msgs.msg import Point, Point32, PoseStamped, Quaternion, Twist
 from nav_msgs.msg import Odometry
 import nest_asyncio
@@ -31,7 +32,6 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from ffw_interfaces.msg import HandJoints
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool
