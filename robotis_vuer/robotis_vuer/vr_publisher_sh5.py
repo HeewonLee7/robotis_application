@@ -31,7 +31,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from robotis_interfaces.msg import HandJoints
+from ffw_interfaces.msg import HandJoints
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool
@@ -395,7 +395,7 @@ class VRTrajectoryPublisher(Node):
 
         # QoS setting
         self.vr_stream_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
